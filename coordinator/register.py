@@ -1,33 +1,33 @@
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
 from enum import Enum
+from typing import Dict, List, Optional
 
 
 class WorkerStatus(str, Enum):
     REGISTERING = "registering"
-    DOWNLOADING = "downloading"
-    LOADING = "loading"
-    ACTIVE = "active"
-    DEAD = "dead"
+    LOADING     = "loading"
+    LOADED      = "loaded"   # model ready; ZMQ not yet wired
+    ACTIVE      = "active"   # fully connected; serving inference
+    DEAD        = "dead"
 
 
 @dataclass
 class WorkerInfo:
-    worker_id: str
-    hostname: str
-    ip: str
-    http_port: int
-    zmq_in_port: int
-    gpu_name: str
-    vram_gb: float
+    worker_id:  str
+    hostname:   str
+    ip:         str
+    http_port:  int
+    gpu_name:   str
+    vram_gb:    float
+    zmq_in_port: int          = 0
     layer_start: Optional[int] = None
-    layer_end: Optional[int] = None
-    is_first: bool = False
-    is_last: bool = False
-    status: WorkerStatus = WorkerStatus.REGISTERING
-    last_heartbeat: float = field(default_factory=time.time)
+    layer_end:   Optional[int] = None
+    is_first:    bool          = False
+    is_last:     bool          = False
+    status:      WorkerStatus  = WorkerStatus.REGISTERING
+    last_heartbeat: float      = field(default_factory=time.time)
 
 
 class WorkerRegistry:
@@ -36,7 +36,7 @@ class WorkerRegistry:
 
     def add(self, **kwargs) -> WorkerInfo:
         wid = str(uuid.uuid4())
-        w = WorkerInfo(worker_id=wid, **kwargs)
+        w   = WorkerInfo(worker_id=wid, **kwargs)
         self._workers[wid] = w
         return w
 
@@ -45,9 +45,6 @@ class WorkerRegistry:
 
     def all(self) -> List[WorkerInfo]:
         return list(self._workers.values())
-
-    def active(self) -> List[WorkerInfo]:
-        return [w for w in self._workers.values() if w.status == WorkerStatus.ACTIVE]
 
     def heartbeat(self, wid: str, status: WorkerStatus):
         if wid in self._workers:
@@ -61,14 +58,24 @@ class WorkerRegistry:
     def remove(self, wid: str):
         self._workers.pop(wid, None)
 
+    # ── Pipeline helpers ──────────────────────────────────────────────────────
+
     def pipeline(self) -> List[WorkerInfo]:
-        """Active workers sorted by layer_start."""
-        workers = [w for w in self.active() if w.layer_start is not None]
-        return sorted(workers, key=lambda w: w.layer_start)
+        """
+        Loaded OR active workers ordered by layer_start.
+        Used by /topology so workers can wire ZMQ before going active.
+        """
+        eligible = [
+            w for w in self._workers.values()
+            if w.status in (WorkerStatus.LOADED, WorkerStatus.ACTIVE)
+            and w.layer_start is not None
+        ]
+        return sorted(eligible, key=lambda w: w.layer_start)
 
     def pipeline_ready(self) -> bool:
+        """True when every layer 0-15 is covered by a loaded/active worker."""
         from shared.config import TOTAL_LAYERS
-        covered = set()
+        covered: set[int] = set()
         for w in self.pipeline():
             for i in range(w.layer_start, w.layer_end + 1):
                 covered.add(i)
