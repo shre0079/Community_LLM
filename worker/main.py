@@ -94,8 +94,9 @@ async def _wait_for_topology() -> dict:
             try:
                 resp = await client.get(f"{COORDINATOR_URL}/topology")
                 data = resp.json()
-                loaded = sum(1 for w in data["workers"] if True)  # count included
-                log.info(f"Topology: {loaded}/3 workers ready={data['ready']}")
+                # Fix: count the actual workers returned, not a tautology
+                n_loaded = len(data["workers"])
+                log.info(f"Topology: {n_loaded}/3 workers loaded, ready={data['ready']}")
                 if data["ready"]:
                     return data
             except Exception as e:
@@ -237,6 +238,21 @@ class InferReq(BaseModel):
     max_new_tokens: int   = 200
     temperature:    float = 0.8
 
+async def _notify_status(status: str):
+    """
+    Fire a single immediate heartbeat to the coordinator.
+    Used at status transitions so the coordinator learns without
+    waiting for the next heartbeat interval.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"{COORDINATOR_URL}/heartbeat",
+                json={"worker_id": worker_id, "status": status},
+            )
+        log.info(f"Notified coordinator: status={status!r}")
+    except Exception as e:
+        log.warning(f"Immediate status notify failed: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -265,27 +281,34 @@ async def lifespan(app: FastAPI):
     with ThreadPoolExecutor(max_workers=1) as load_pool:
         await loop.run_in_executor(load_pool, runner.load)
 
-    # ── Step 3: Announce loaded (breaks coordinator deadlock) ─────────────
+    # ── Step 3: Set loaded + immediately notify coordinator ───────────────
+    # This MUST happen before topology polling.
+    # The heartbeat fires every 5s; waiting for it would stall all 3 workers.
     current_status = "loaded"
-    log.info("Model loaded. Status → loaded. Waiting for other workers…")
+    await _notify_status("loaded")
+    log.info("Status → loaded. Notified coordinator. Waiting for other workers…")
 
-    # ── Step 4: Poll topology until all workers are loaded ────────────────
-    topology = await _wait_for_topology()
-
-    # ── Step 5: Wire ZMQ ─────────────────────────────────────────────────
-    _wire_zmq(assignment, topology)
-
-    # ── Step 6: Start heartbeat ───────────────────────────────────────────
-    hb = Heartbeat(worker_id, lambda: current_status)
+    # ── Step 4: Start heartbeat NOW (before topology poll) ────────────────
+    # Heartbeat keeps the coordinator updated while we wait for peers.
+    hb      = Heartbeat(worker_id, lambda: current_status)
     hb_task = asyncio.create_task(hb.run())
 
-    # ── Step 7: Start ZMQ loop for middle / last workers ─────────────────
+    # ── Step 5: Poll topology until all workers are loaded ────────────────
+    topology = await _wait_for_topology()
+
+    # ── Step 6: Wire ZMQ ─────────────────────────────────────────────────
+    _wire_zmq(assignment, topology)
+
+    # ── Step 7: Go active ─────────────────────────────────────────────────
+    current_status = "active"
+    await _notify_status("active")
+
+    # ── Step 8: Start ZMQ loop for middle / last workers ─────────────────
     zmq_future = None
     if not result["is_first"]:
         _stop_event.clear()
         zmq_future = loop.run_in_executor(_zmq_executor, _zmq_loop)
 
-    current_status = "active"
     log.info(
         f"Worker ACTIVE — layers {result['layer_start']}–{result['layer_end']} "
         f"is_first={result['is_first']} is_last={result['is_last']}"
