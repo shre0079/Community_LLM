@@ -1,63 +1,89 @@
 import logging
-import zmq
+
 import torch
-from shared.tensor_io import serialize, deserialize, serialize_token, deserialize_token
+import zmq
+
+from shared.tensor_io import deserialize, deserialize_token, serialize, serialize_token
 
 log = logging.getLogger(__name__)
 
 
 class Pipeline:
     """
-    ZMQ socket management for the worker pipeline.
+    ZMQ wiring for the 3-worker pipeline.
 
-    Topology:
-      Worker1.PUSH → Worker2.PULL  (hidden states)
-      Worker2.PUSH → Worker3.PULL  (hidden states)
-      Worker3.PUSH → Worker1.PULL  (generated token + is_done)
-
-    Worker1 uses ZMQ_IN_PORT=5556 (result return from Worker3)
-    Worker2,3 use ZMQ_IN_PORT=5555 (hidden states from previous)
+    Ports (set by coordinator, returned in registration response):
+      Worker 1  PULL :5556  ← tokens from Worker 3
+      Worker 1  PUSH → Worker 2 :5555
+      Worker 2  PULL :5555  ← hidden states from Worker 1
+      Worker 2  PUSH → Worker 3 :5555
+      Worker 3  PULL :5555  ← hidden states from Worker 2
+      Worker 3  PUSH → Worker 1 :5556
     """
 
-    def __init__(self, is_first: bool, is_last: bool, zmq_in_port: int):
-        self.is_first = is_first
-        self.is_last = is_last
-        self.zmq_in_port = zmq_in_port
-        self.ctx = zmq.Context()
-        self.pull = None
-        self.push = None
+    def __init__(
+        self,
+        is_first: bool,
+        is_last: bool,
+        zmq_in_port: int,
+        recv_timeout_ms: int = 30_000,
+    ):
+        self.is_first        = is_first
+        self.is_last         = is_last
+        self.zmq_in_port     = zmq_in_port
+        self.recv_timeout_ms = recv_timeout_ms
+
+        self.ctx  = zmq.Context()
+        self.pull: zmq.Socket | None = None
+        self.push: zmq.Socket | None = None
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def bind_pull(self):
-        """Bind our incoming PULL socket."""
         self.pull = self.ctx.socket(zmq.PULL)
+        self.pull.setsockopt(zmq.RCVTIMEO, self.recv_timeout_ms)
         self.pull.bind(f"tcp://*:{self.zmq_in_port}")
-        log.info(f"PULL socket bound on port {self.zmq_in_port}")
+        log.info(f"PULL bound on :{self.zmq_in_port}  timeout={self.recv_timeout_ms}ms")
 
-    def connect_push(self, next_ip: str, next_port: int):
-        """Connect our PUSH socket to the next worker's PULL socket."""
+    def connect_push(self, target_ip: str, target_port: int):
         self.push = self.ctx.socket(zmq.PUSH)
-        self.push.connect(f"tcp://{next_ip}:{next_port}")
-        log.info(f"PUSH socket connected to {next_ip}:{next_port}")
+        self.push.connect(f"tcp://{target_ip}:{target_port}")
+        log.info(f"PUSH connected → {target_ip}:{target_port}")
 
-    def send_hidden(self, tensor: torch.Tensor):
-        parts = serialize(tensor)
+    def close(self):
+        for s in (self.pull, self.push):
+            if s:
+                s.close()
+        self.ctx.term()
+
+    # ── Hidden-state transfer ─────────────────────────────────────────────────
+
+    def send_hidden(self, tensor: torch.Tensor, meta: dict = None):
+        """Send hidden states + metadata to next worker."""
+        parts  = serialize(tensor, meta)
+        nbytes = sum(len(p) for p in parts)
+        log.debug(f"send_hidden {tensor.shape}  {nbytes / 1024:.1f} KB")
         self.push.send_multipart(parts)
 
-    def recv_hidden(self) -> torch.Tensor:
-        parts = self.pull.recv_multipart()
-        tensor, _ = deserialize(parts)
-        return tensor
+    def recv_hidden(self) -> tuple[torch.Tensor, dict]:
+        """
+        Receive hidden states + metadata from previous worker.
+        Raises zmq.error.Again on timeout.
+        """
+        parts          = self.pull.recv_multipart()   # Again on timeout
+        tensor, meta   = deserialize(parts)
+        log.debug(f"recv_hidden {tensor.shape}")
+        return tensor, meta
+
+    # ── Token transfer ────────────────────────────────────────────────────────
 
     def send_token(self, token_id: int, is_done: bool):
         self.push.send(serialize_token(token_id, is_done))
 
     def recv_token(self) -> tuple[int, bool]:
-        data = self.pull.recv()
+        """
+        Receive next-token result from last worker.
+        Raises zmq.error.Again on timeout.
+        """
+        data = self.pull.recv()                       # Again on timeout
         return deserialize_token(data)
-
-    def close(self):
-        if self.pull:
-            self.pull.close()
-        if self.push:
-            self.push.close()
-        self.ctx.term()
