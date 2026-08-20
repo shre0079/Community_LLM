@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -9,201 +10,297 @@ from contextlib import asynccontextmanager
 import httpx
 import torch
 import uvicorn
+import zmq.error
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from shared.config import (
-    COORDINATOR_URL, WORKER_HTTP_PORT,
-    ZMQ_IN_PORT, ZMQ_RESULT_PORT
+    COORDINATOR_URL,
+    WORKER_HTTP_PORT,
+    ZMQ_RECV_TIMEOUT_MS,
 )
+from worker.heartbeat import Heartbeat
 from worker.model import ShardRunner
 from worker.pipeline import Pipeline
-from worker.heartbeat import Heartbeat
 
 log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
 # ── Global state ──────────────────────────────────────────────────────────────
-runner: ShardRunner = None
-pipeline: Pipeline = None
-heartbeat: Heartbeat = None
-worker_id: str = None
-current_status: str = "loading"
-executor = ThreadPoolExecutor(max_workers=1)
+
+runner:         ShardRunner | None = None
+pipeline_conn:  Pipeline    | None = None
+worker_id:      str | None         = None
+current_status: str                = "registering"
+assignment:     dict               = {}
+
+# Dedicated executors — ZMQ loop and inference never compete for the same thread.
+_zmq_executor   = ThreadPoolExecutor(max_workers=1, thread_name_prefix="zmq")
+_infer_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="infer")
+_stop_event     = threading.Event()
 
 
-# ── Registration + Topology ───────────────────────────────────────────────────
+# ── Registration ──────────────────────────────────────────────────────────────
 
-async def register() -> dict:
-    my_ip = os.getenv("MY_IP", socket.gethostbyname(socket.gethostname()))
-    zmq_port = ZMQ_RESULT_PORT  # Worker 1 listens on 5556 for return tokens
-
-    async with httpx.AsyncClient() as client:
+async def _register() -> dict:
+    my_ip = os.getenv("MY_IP") or _lan_ip()
+    async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.post(
             f"{COORDINATOR_URL}/register",
             json={
-                "hostname": socket.gethostname(),
-                "ip": my_ip,
+                "hostname":  socket.gethostname(),
+                "ip":        my_ip,
                 "http_port": WORKER_HTTP_PORT,
-                "zmq_in_port": zmq_port,  # what we tell coordinator we listen on
-                "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
-                "vram_gb": torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0,
+                "gpu_name":  (
+                    torch.cuda.get_device_name(0)
+                    if torch.cuda.is_available() else "CPU"
+                ),
+                "vram_gb": (
+                    torch.cuda.get_device_properties(0).total_memory / 1e9
+                    if torch.cuda.is_available() else 0.0
+                ),
             },
-            timeout=10.0,
         )
         resp.raise_for_status()
         return resp.json()
 
 
-async def wait_for_topology() -> dict:
-    """Poll coordinator until all workers are registered and active."""
-    log.info("Waiting for full pipeline topology...")
-    async with httpx.AsyncClient() as client:
+def _lan_ip() -> str:
+    """Return the machine's outbound LAN IP (avoids 127.0.0.1)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return socket.gethostbyname(socket.gethostname())
+
+
+# ── Topology polling ──────────────────────────────────────────────────────────
+
+async def _wait_for_topology() -> dict:
+    """
+    Poll /topology until all workers are in 'loaded' or 'active' state.
+    Workers reach this point only after finishing model load, so
+    pipeline_ready=True means ZMQ wiring can safely proceed.
+    """
+    log.info("Waiting for full pipeline topology…")
+    async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
             try:
-                resp = await client.get(f"{COORDINATOR_URL}/topology", timeout=5.0)
+                resp = await client.get(f"{COORDINATOR_URL}/topology")
                 data = resp.json()
+                loaded = sum(1 for w in data["workers"] if True)  # count included
+                log.info(f"Topology: {loaded}/3 workers ready={data['ready']}")
                 if data["ready"]:
-                    log.info("Pipeline topology ready.")
                     return data
             except Exception as e:
-                log.warning(f"Topology not ready: {e}")
+                log.debug(f"Topology poll error: {e}")
             await asyncio.sleep(5)
 
 
-def setup_zmq(my_assignment: dict, topology: dict):
-    """Wire up ZMQ sockets based on pipeline topology."""
-    global pipeline
-    is_first = my_assignment["is_first"]
-    is_last = my_assignment["is_last"]
+# ── ZMQ wiring ────────────────────────────────────────────────────────────────
 
-    # Determine which port WE listen on
-    if is_first:
-        my_in_port = ZMQ_RESULT_PORT  # Worker 1 receives tokens from Worker 3
-    else:
-        my_in_port = ZMQ_IN_PORT      # Workers 2,3 receive hidden states
+def _wire_zmq(my_assignment: dict, topology: dict):
+    global pipeline_conn
 
-    pipeline = Pipeline(is_first=is_first, is_last=is_last, zmq_in_port=my_in_port)
-    pipeline.bind_pull()
+    is_first     = my_assignment["is_first"]
+    is_last      = my_assignment["is_last"]
+    zmq_in_port  = my_assignment["zmq_in_port"]
 
-    # Find the next worker to push to
-    workers = topology["workers"]
-    my_start = my_assignment["layer_start"]
+    pipeline_conn = Pipeline(
+        is_first=is_first,
+        is_last=is_last,
+        zmq_in_port=zmq_in_port,
+        recv_timeout_ms=ZMQ_RECV_TIMEOUT_MS,
+    )
+    pipeline_conn.bind_pull()
+
+    workers   = topology["workers"]
+    layer_end = my_assignment["layer_end"]
 
     if is_last:
-        # Last worker pushes tokens back to First worker
+        # Last worker pushes tokens back to first worker.
         first = next(w for w in workers if w["is_first"])
-        pipeline.connect_push(first["ip"], ZMQ_RESULT_PORT)
+        pipeline_conn.connect_push(first["ip"], first["zmq_in_port"])
     else:
-        # Push hidden states to next worker in pipeline
-        next_w = next(w for w in workers if w["layer_start"] == my_assignment["layer_end"] + 1)
-        pipeline.connect_push(next_w["ip"], ZMQ_IN_PORT)
+        # Push hidden states to the next worker in the pipeline.
+        next_w = next(w for w in workers if w["layer_start"] == layer_end + 1)
+        pipeline_conn.connect_push(next_w["ip"], next_w["zmq_in_port"])
 
-    log.info(f"ZMQ pipeline wired up. is_first={is_first}, is_last={is_last}")
+    log.info(f"ZMQ wired. is_first={is_first} is_last={is_last}")
 
 
-# ── Generation Loop ───────────────────────────────────────────────────────────
+# ── ZMQ processing loop (middle & last workers) ───────────────────────────────
 
-def run_middle_worker_loop():
-    """Workers 2 and 3: continuously receive, process, forward."""
-    log.info("Middle/last worker loop started.")
-    while True:
+def _zmq_loop():
+    """
+    Runs in _zmq_executor (dedicated thread, never blocks inference).
+
+    Middle worker: recv hidden → forward → send hidden (+ metadata)
+    Last worker:   recv hidden → forward with temperature → send token
+    """
+    log.info("ZMQ processing loop started.")
+    while not _stop_event.is_set():
         try:
+            hidden, meta = pipeline_conn.recv_hidden()   # raises Again on timeout
+            temperature  = float(meta.get("temperature", 1.0))
+            step         = meta.get("step", -1)
+
+            out = runner.forward(hidden, temperature=temperature)
+
             if runner.is_last:
-                hidden = pipeline.recv_hidden()
-                next_token = runner.forward(hidden)
-                token_id = next_token.item()
-                is_done = (token_id == runner.eos_token_id)
-                pipeline.send_token(token_id, is_done)
+                token_id = out.item()
+                is_done  = (token_id == runner.eos_token_id)
+                pipeline_conn.send_token(token_id, is_done)
+                log.debug(f"Step {step}: token={token_id} done={is_done}")
             else:
-                hidden = pipeline.recv_hidden()
-                out = runner.forward(hidden)
-                pipeline.send_hidden(out)
+                # Forward metadata so the last worker receives temperature.
+                pipeline_conn.send_hidden(out, meta)
+                log.debug(f"Step {step}: forwarded hidden {out.shape}")
+
+        except zmq.error.Again:
+            # Timeout — normal during idle periods. Check stop_event and loop.
+            continue
         except Exception as e:
-            log.error(f"Worker loop error: {e}")
+            log.error(f"ZMQ loop error: {e}", exc_info=True)
+            time.sleep(0.1)
+
+    log.info("ZMQ processing loop stopped.")
 
 
-def generate(prompt: str, max_new_tokens: int, temperature: float) -> str:
-    """
-    Full autoregressive generation loop — runs on Worker 1.
-    Each step: embed + own layers → send → receive token → repeat.
-    """
-    input_ids = runner.encode(prompt)  # [1, prompt_len]
-    generated_ids = input_ids.clone()
-    generated_tokens = []
-    
-    start = time.time()
+# ── Autoregressive generation (first worker only) ─────────────────────────────
+
+def _generate(prompt: str, max_new_tokens: int, temperature: float) -> dict:
+    input_ids       = runner.encode(prompt)      # [1, prompt_len]
+    generated_ids   = input_ids.clone()
+    generated_tokens: list[int] = []
+    t0 = time.time()
 
     for step in range(max_new_tokens):
-        # Worker 1 forward pass on its layers
-        hidden = runner.forward(generated_ids)  # [1, seq_len, 2048]
+        # Our layers: embed + layers 0-5
+        hidden = runner.forward(generated_ids, temperature=temperature)
 
-        # Send hidden states down the pipeline
-        pipeline.send_hidden(hidden)
+        # Log transfer cost — grows linearly with sequence length
+        nbytes = hidden.element_size() * hidden.nelement()
+        log.info(
+            f"Step {step + 1}/{max_new_tokens} "
+            f"seq_len={generated_ids.shape[1]} "
+            f"payload={nbytes / 1024:.1f} KB"
+        )
 
-        # Wait for generated token from Worker 3
-        token_id, is_done = pipeline.recv_token()
+        # Send downstream with temperature embedded in metadata
+        pipeline_conn.send_hidden(hidden, {"temperature": temperature, "step": step})
+
+        # Wait for next-token from last worker
+        try:
+            token_id, is_done = pipeline_conn.recv_token()
+        except zmq.error.Again:
+            raise TimeoutError(
+                "No token received within timeout window. "
+                "A downstream worker may be dead."
+            )
 
         generated_tokens.append(token_id)
-        new_tok = torch.tensor([[token_id]])
-        generated_ids = torch.cat([generated_ids, new_tok], dim=1)
+        generated_ids = torch.cat(
+            [generated_ids, torch.tensor([[token_id]], dtype=torch.long)], dim=1
+        )
 
-        if is_done or token_id == runner.eos_token_id:
+        if is_done:
             break
 
-    elapsed = time.time() - start
-    tokens_per_sec = len(generated_tokens) / elapsed
-    log.info(f"Generated {len(generated_tokens)} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+    elapsed   = time.time() - t0
+    tok_per_s = len(generated_tokens) / elapsed if elapsed > 0 else 0.0
 
-    return runner.decode(torch.tensor(generated_tokens))
+    log.info(
+        f"Done. {len(generated_tokens)} tokens in {elapsed:.2f}s "
+        f"({tok_per_s:.2f} tok/s)"
+    )
+
+    return {
+        "response":         runner.decode(generated_tokens),
+        "tokens_generated": len(generated_tokens),
+        "elapsed_s":        round(elapsed, 3),
+        "tok_per_s":        round(tok_per_s, 2),
+        "vram_used_gb":     round(runner.vram_used_gb(), 3),
+    }
 
 
-# ── FastAPI App ───────────────────────────────────────────────────────────────
+# ── FastAPI ───────────────────────────────────────────────────────────────────
 
 class InferReq(BaseModel):
-    prompt: str
-    max_new_tokens: int = 200
-    temperature: float = 0.8
+    prompt:         str
+    max_new_tokens: int   = 200
+    temperature:    float = 0.8
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global runner, worker_id, current_status
+    global runner, worker_id, current_status, assignment
 
-    # 1. Register with coordinator
+    # ── Step 1: Register ──────────────────────────────────────────────────
     current_status = "registering"
-    assignment = await register()
-    worker_id = assignment["worker_id"]
-    log.info(f"Assigned layers {assignment['layer_start']}–{assignment['layer_end']}")
+    result         = await _register()
+    worker_id      = result["worker_id"]
+    assignment     = result
+    log.info(
+        f"Registered. ID={worker_id} "
+        f"layers={result['layer_start']}–{result['layer_end']} "
+        f"zmq_in_port={result['zmq_in_port']}"
+    )
 
-    # 2. Load model shard
+    # ── Step 2: Load model ────────────────────────────────────────────────
     current_status = "loading"
     runner = ShardRunner(
-        layer_start=assignment["layer_start"],
-        layer_end=assignment["layer_end"],
-        is_first=assignment["is_first"],
-        is_last=assignment["is_last"],
+        layer_start=result["layer_start"],
+        layer_end=result["layer_end"],
+        is_first=result["is_first"],
+        is_last=result["is_last"],
     )
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, runner.load)
+    with ThreadPoolExecutor(max_workers=1) as load_pool:
+        await loop.run_in_executor(load_pool, runner.load)
 
-    # 3. Wait for full topology, set up ZMQ
-    topology = await wait_for_topology()
-    setup_zmq(assignment, topology)
+    # ── Step 3: Announce loaded (breaks coordinator deadlock) ─────────────
+    current_status = "loaded"
+    log.info("Model loaded. Status → loaded. Waiting for other workers…")
 
-    # 4. Start heartbeat
+    # ── Step 4: Poll topology until all workers are loaded ────────────────
+    topology = await _wait_for_topology()
+
+    # ── Step 5: Wire ZMQ ─────────────────────────────────────────────────
+    _wire_zmq(assignment, topology)
+
+    # ── Step 6: Start heartbeat ───────────────────────────────────────────
     hb = Heartbeat(worker_id, lambda: current_status)
-    asyncio.create_task(hb.run())
+    hb_task = asyncio.create_task(hb.run())
 
-    # 5. Start processing loop for middle/last workers
-    if not assignment["is_first"]:
-        loop.run_in_executor(executor, run_middle_worker_loop)
+    # ── Step 7: Start ZMQ loop for middle / last workers ─────────────────
+    zmq_future = None
+    if not result["is_first"]:
+        _stop_event.clear()
+        zmq_future = loop.run_in_executor(_zmq_executor, _zmq_loop)
 
     current_status = "active"
-    log.info("Worker is ACTIVE and ready.")
-    yield
+    log.info(
+        f"Worker ACTIVE — layers {result['layer_start']}–{result['layer_end']} "
+        f"is_first={result['is_first']} is_last={result['is_last']}"
+    )
 
-    pipeline.close()
+    yield   # ─── application runs ───────────────────────────────────────────
+
+    # ── Shutdown ──────────────────────────────────────────────────────────
+    log.info("Shutting down worker…")
+    _stop_event.set()
+    hb.stop()
+    hb_task.cancel()
+    if pipeline_conn:
+        pipeline_conn.close()
+    log.info("Worker shut down cleanly.")
 
 
 app = FastAPI(title="OLMoE Worker", lifespan=lifespan)
@@ -211,42 +308,41 @@ app = FastAPI(title="OLMoE Worker", lifespan=lifespan)
 
 @app.post("/infer")
 async def infer(req: InferReq):
-    if not runner.is_first:
-        raise HTTPException(400, "Only the first worker accepts inference requests")
-    global current_status
-    current_status = "active"
-
+    if not runner or not runner.is_first:
+        raise HTTPException(
+            status_code=400,
+            detail="Only the first worker accepts inference requests.",
+        )
+    if current_status != "active":
+        raise HTTPException(
+            status_code=503,
+            detail=f"Worker not ready (status={current_status!r})",
+        )
     loop = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(
-            executor,
-            generate,
-            req.prompt,
-            req.max_new_tokens,
-            req.temperature,
+            _infer_executor, _generate,
+            req.prompt, req.max_new_tokens, req.temperature,
         )
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e))
     except Exception as e:
-        log.error(f"Generation error: {e}")
-        raise HTTPException(500, str(e))
-
-    return {
-        "response": result,
-        "prompt": req.prompt,
-        "vram_used_gb": runner.vram_used_gb(),
-    }
+        log.exception("Inference error")
+        raise HTTPException(status_code=500, detail=str(e))
+    return result
 
 
 @app.get("/health")
 async def health():
     return {
-        "status": current_status,
-        "worker_id": worker_id,
-        "layers": f"{runner.layer_start}–{runner.layer_end}" if runner else "loading",
-        "vram_used_gb": runner.vram_used_gb() if runner else 0,
+        "status":       current_status,
+        "worker_id":    worker_id,
+        "layers":       f"{runner.layer_start}–{runner.layer_end}" if runner else None,
+        "is_first":     assignment.get("is_first"),
+        "is_last":      assignment.get("is_last"),
+        "vram_used_gb": runner.vram_used_gb() if runner else 0.0,
     }
 
 
 if __name__ == "__main__":
-    coordinator = os.getenv("COORDINATOR_HOST", "localhost")
-    os.environ["COORDINATOR_HOST"] = coordinator
     uvicorn.run("worker.main:app", host="0.0.0.0", port=WORKER_HTTP_PORT, log_level="info")
