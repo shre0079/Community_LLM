@@ -151,8 +151,9 @@ def _zmq_loop():
             hidden, meta = pipeline_conn.recv_hidden()   # raises Again on timeout
             temperature  = float(meta.get("temperature", 1.0))
             step         = meta.get("step", -1)
+            reset_cache  = bool(meta.get("reset_cache", False))
 
-            out = runner.forward(hidden, temperature=temperature)
+            out = runner.forward(hidden, temperature=temperature, reset_cache=reset_cache)
 
             if runner.is_last:
                 token_id = out.item()
@@ -177,25 +178,39 @@ def _zmq_loop():
 # ── Autoregressive generation (first worker only) ─────────────────────────────
 
 def _generate(prompt: str, max_new_tokens: int, temperature: float) -> dict:
-    input_ids       = runner.encode(prompt)      # [1, prompt_len]
-    generated_ids   = input_ids.clone()
+    """
+    KV-cached autoregressive loop. Step 0 is a single prefill pass over the
+    full prompt (reset_cache=True on every worker). Every step after that
+    sends only the single newly generated token — each worker's own
+    self.kv_cache already holds everything before it, so payload size is
+    now flat per step instead of growing with sequence length.
+    """
+    input_ids         = runner.encode(prompt)      # [1, prompt_len]
+    next_input        = input_ids                  # what THIS worker still needs to process
     generated_tokens: list[int] = []
+    seq_len           = input_ids.shape[1]          # for logging/metadata only
     t0 = time.time()
 
     for step in range(max_new_tokens):
-        # Our layers: embed + layers 0-5
-        hidden = runner.forward(generated_ids, temperature=temperature)
+        reset_cache = (step == 0)
 
-        # Log transfer cost — grows linearly with sequence length
+        # Our layers: embed (prefill: full prompt / decode: 1 new token)
+        hidden = runner.forward(next_input, temperature=temperature, reset_cache=reset_cache)
+
+        # Payload is now flat per step (1 position) instead of growing with seq_len.
         nbytes = hidden.element_size() * hidden.nelement()
         log.info(
             f"Step {step + 1}/{max_new_tokens} "
-            f"seq_len={generated_ids.shape[1]} "
+            f"{'prefill' if reset_cache else 'decode'} "
+            f"new_positions={next_input.shape[1]} seq_len={seq_len} "
             f"payload={nbytes / 1024:.1f} KB"
         )
 
-        # Send downstream with temperature embedded in metadata
-        pipeline_conn.send_hidden(hidden, {"temperature": temperature, "step": step})
+        # Send downstream with temperature + reset_cache so every stage's
+        # cache stays in sync for this request.
+        pipeline_conn.send_hidden(
+            hidden, {"temperature": temperature, "step": step, "reset_cache": reset_cache}
+        )
 
         # Wait for next-token from last worker
         try:
@@ -207,9 +222,10 @@ def _generate(prompt: str, max_new_tokens: int, temperature: float) -> dict:
             )
 
         generated_tokens.append(token_id)
-        generated_ids = torch.cat(
-            [generated_ids, torch.tensor([[token_id]], dtype=torch.long)], dim=1
-        )
+        seq_len += 1
+        # From here on we only ever feed the single newest token back in —
+        # past context lives in each worker's kv_cache, not in this tensor.
+        next_input = torch.tensor([[token_id]], dtype=torch.long)
 
         if is_done:
             break

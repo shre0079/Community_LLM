@@ -2,6 +2,7 @@ import logging
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers.cache_utils import DynamicCache
 
 from shared.config import MODEL_ID, MODEL_CACHE_DIR, SIMULATE_VRAM_GB
 
@@ -33,6 +34,11 @@ class ShardRunner:
         self.model       = None
         self.tokenizer   = None
         self.device      = self._detect_device()
+
+        # KV-cache for this worker's layer slice, scoped to the single
+        # in-flight request (no concurrent sequences until Phase 4's
+        # continuous batching). Reset at the start of every new request.
+        self.kv_cache: DynamicCache | None = None
 
     @staticmethod
     def _detect_device() -> str:
@@ -81,26 +87,45 @@ class ShardRunner:
     # ── Forward ──────────────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def forward(self, input_data: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    def forward(
+        self,
+        input_data: torch.Tensor,
+        temperature: float = 1.0,
+        reset_cache: bool = False,
+    ) -> torch.Tensor:
         """
-        input_data:
-          is_first → token ids [1, seq_len]
-          otherwise → hidden states [1, seq_len, hidden_dim]  (float16, CPU)
+        input_data — only the NEW tokens/positions for this step, not the
+        full sequence:
+          is_first, reset_cache=True  (prefill) → full prompt token ids [1, prompt_len]
+          is_first, reset_cache=False (decode)  → single new token id   [1, 1]
+          otherwise                             → hidden states for the same
+                                                   new positions [1, new_len, hidden_dim]
+                                                   (float16, CPU)
+
+        Past context for every position before this step lives in
+        self.kv_cache (one DynamicCache per worker, scoped to the single
+        in-flight request) and is extended in place by each layer call.
 
         Returns:
           is_last → next token id as scalar tensor (CPU)
-          otherwise → hidden states [1, seq_len, hidden_dim] (float16, CPU)
+          otherwise → hidden states for the new positions [1, new_len, hidden_dim] (float16, CPU)
         """
         m = self.model
+
+        if reset_cache or self.kv_cache is None:
+            self.kv_cache = DynamicCache()
 
         if self.is_first:
             hidden = m.model.embed_tokens(input_data.to(self.device))
         else:
             hidden = input_data.to(self.device).to(torch.float16)
 
-        seq_len      = hidden.shape[1]
-        position_ids = torch.arange(seq_len, dtype=torch.long, device=self.device).unsqueeze(0)
-        causal_mask  = self._causal_mask(seq_len, hidden.device, hidden.dtype)
+        new_len      = hidden.shape[1]
+        past_len     = self.kv_cache.get_seq_length(self.layer_start)
+        position_ids = torch.arange(
+            past_len, past_len + new_len, dtype=torch.long, device=self.device
+        ).unsqueeze(0)
+        causal_mask = self._causal_mask(new_len, past_len, hidden.device, hidden.dtype)
 
         # Precompute rotary embeddings once if model exposes them at the top level.
         # Layer-level fallback: each OlmoeAttention computes its own from position_ids.
@@ -113,7 +138,9 @@ class ShardRunner:
             kwargs = dict(
                 attention_mask=causal_mask,
                 position_ids=position_ids,
-                use_cache=False,
+                past_key_value=self.kv_cache,
+                cache_position=position_ids[0],
+                use_cache=True,
                 output_attentions=False,
                 output_router_logits=False,   # suppress MoE router overhead
             )
@@ -122,15 +149,18 @@ class ShardRunner:
             try:
                 out = layer(hidden, **kwargs)
             except TypeError:
-                # Older transformer versions don't accept all kwargs — strip and retry.
+                # Older transformer versions don't accept all kwargs — strip to the
+                # legacy subset. NOTE: if this fallback fires, use_cache/past_key_value
+                # are dropped too, which silently disables caching for this layer call —
+                # verify on the real transformers version before trusting cached decode.
                 out = layer(hidden, attention_mask=causal_mask, position_ids=position_ids)
 
             hidden = out[0] if isinstance(out, tuple) else out
 
         if self.is_last:
             hidden      = m.model.norm(hidden)
-            logits      = m.lm_head(hidden)       # [1, seq_len, vocab]
-            last_logits = logits[0, -1, :]        # [vocab]
+            logits      = m.lm_head(hidden)       # [1, new_len, vocab]
+            last_logits = logits[0, -1, :]        # [vocab]  — last of the new positions
             token_id    = self._sample(last_logits, temperature)
             return torch.tensor(token_id, dtype=torch.long)
         else:
@@ -147,13 +177,23 @@ class ShardRunner:
     # ── Causal mask ──────────────────────────────────────────────────────────
 
     @staticmethod
-    def _causal_mask(seq_len: int, device, dtype) -> torch.Tensor:
-        """Upper-triangular −∞ mask, shape [1, 1, seq_len, seq_len]."""
-        neg_inf = torch.finfo(dtype).min
-        mask    = torch.triu(
-            torch.full((seq_len, seq_len), neg_inf, device=device, dtype=dtype),
+    def _causal_mask(new_len: int, past_len: int, device, dtype) -> torch.Tensor:
+        """
+        Mask for `new_len` query positions attending over `past_len` cached
+        keys plus themselves: shape [1, 1, new_len, past_len + new_len].
+        Past positions are always visible; the new-token block is causal
+        (upper-triangular -inf) same as before, just offset by past_len.
+        With past_len=0 (prefill / no cache) this is identical to the
+        original full causal mask.
+        """
+        neg_inf   = torch.finfo(dtype).min
+        total_len = past_len + new_len
+        mask      = torch.zeros((new_len, total_len), device=device, dtype=dtype)
+        new_block = torch.triu(
+            torch.full((new_len, new_len), neg_inf, device=device, dtype=dtype),
             diagonal=1,
         )
+        mask[:, past_len:] = new_block
         return mask.unsqueeze(0).unsqueeze(0)
 
     # ── Tokenizer helpers ────────────────────────────────────────────────────
