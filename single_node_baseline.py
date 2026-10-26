@@ -63,38 +63,80 @@ def greedy_decode(runner: ShardRunner, prompt: str, max_new_tokens: int, use_cac
     return tokens
 
 
-def main():
-    torch.manual_seed(SEED)
+def check_cache_correctness(
+    prompt: str = PROMPT,
+    max_new_tokens: int = MAX_NEW_TOKENS,
+    temperature: float = TEMPERATURE,
+    seed: int = SEED,
+) -> dict:
+    """
+    Loads the full model once and runs both the cached and uncached decode
+    paths, returning a result dict rather than printing/exiting — so this
+    same check can be driven either by main() below (human-readable CLI
+    output) or by test_regression.py's pytest test (plain assertion).
 
+    Returns:
+      {
+        "cached_tokens": [...], "uncached_tokens": [...],
+        "cached_text": str, "uncached_text": str,
+        "match": bool,
+        "first_divergence_step": int | None,
+      }
+    """
+    torch.manual_seed(seed)
     runner = ShardRunner(layer_start=0, layer_end=15, is_first=True, is_last=True)
-    print(f"Loading full model on {runner._detect_device()}…")
     runner.load()
 
-    print(f"\nPrompt: {PROMPT!r}  max_new_tokens={MAX_NEW_TOKENS}  temperature={TEMPERATURE}")
+    torch.manual_seed(seed)
+    cached_tokens = greedy_decode(runner, prompt, max_new_tokens, use_cache=True)
 
-    print("\n[1/2] Cached decode (prefill once, then single-token steps)…")
-    torch.manual_seed(SEED)
-    cached_tokens = greedy_decode(runner, PROMPT, MAX_NEW_TOKENS, use_cache=True)
-    print("Cached tokens:  ", cached_tokens)
-    print("Cached text:    ", repr(runner.decode(cached_tokens)))
+    torch.manual_seed(seed)
+    uncached_tokens = greedy_decode(runner, prompt, max_new_tokens, use_cache=False)
 
-    print("\n[2/2] Uncached decode (full-sequence reprocess every step, old behavior)…")
-    torch.manual_seed(SEED)
-    uncached_tokens = greedy_decode(runner, PROMPT, MAX_NEW_TOKENS, use_cache=False)
-    print("Uncached tokens:", uncached_tokens)
-    print("Uncached text:  ", repr(runner.decode(uncached_tokens)))
-
-    print("\n=== Result ===")
-    if cached_tokens == uncached_tokens:
-        print("PASS — cached and uncached decoding produced identical token sequences.")
-        print(f"\nREFERENCE_TOKENS for the 2-machine integration test:\n{cached_tokens}")
-    else:
-        print("FAIL — cached and uncached decoding DIVERGED. Do not trust the KV-cache path.")
+    match = cached_tokens == uncached_tokens
+    first_divergence_step = None
+    if not match:
         min_len = min(len(cached_tokens), len(uncached_tokens))
         for i in range(min_len):
             if cached_tokens[i] != uncached_tokens[i]:
-                print(f"First divergence at step {i}: cached={cached_tokens[i]} uncached={uncached_tokens[i]}")
+                first_divergence_step = i
                 break
+
+    return {
+        "cached_tokens":          cached_tokens,
+        "uncached_tokens":        uncached_tokens,
+        "cached_text":            runner.decode(cached_tokens),
+        "uncached_text":          runner.decode(uncached_tokens),
+        "match":                  match,
+        "first_divergence_step":  first_divergence_step,
+    }
+
+
+def main():
+    print(f"Loading full model…")
+    print(f"\nPrompt: {PROMPT!r}  max_new_tokens={MAX_NEW_TOKENS}  temperature={TEMPERATURE}")
+
+    result = check_cache_correctness()
+
+    print("\n[1/2] Cached decode (prefill once, then single-token steps)…")
+    print("Cached tokens:  ", result["cached_tokens"])
+    print("Cached text:    ", repr(result["cached_text"]))
+
+    print("\n[2/2] Uncached decode (full-sequence reprocess every step, old behavior)…")
+    print("Uncached tokens:", result["uncached_tokens"])
+    print("Uncached text:  ", repr(result["uncached_text"]))
+
+    print("\n=== Result ===")
+    if result["match"]:
+        print("PASS — cached and uncached decoding produced identical token sequences.")
+        print(f"\nREFERENCE_TOKENS for the 2-machine integration test:\n{result['cached_tokens']}")
+    else:
+        print("FAIL — cached and uncached decoding DIVERGED. Do not trust the KV-cache path.")
+        print(
+            f"First divergence at step {result['first_divergence_step']}: "
+            f"cached={result['cached_tokens'][result['first_divergence_step']]} "
+            f"uncached={result['uncached_tokens'][result['first_divergence_step']]}"
+        )
         raise SystemExit(1)
 
 

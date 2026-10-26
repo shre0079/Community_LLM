@@ -96,8 +96,10 @@ async function sendMessage() {
   sendBtn.disabled = true;
 
   addMessage(text, 'user');
-  const thinking = addMessage('Thinking…', 'assistant thinking');
+  const reply = addMessage('…', 'assistant thinking');
   const t0 = Date.now();
+  let full = '';
+  let final = null;
 
   try {
     const res = await fetch('/infer', {
@@ -105,13 +107,49 @@ async function sendMessage() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({prompt: text, max_new_tokens: 200, temperature: 0.8})
     });
-    const data = await res.json();
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+
+    // /infer streams NDJSON (one JSON object per line) — per-token chunks
+    // while generating, then a final {done:true, response, vram_used_gb,...}
+    // line. Not SSE, just newline-delimited JSON read incrementally.
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream: true});
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        const item = JSON.parse(line);
+        if (item.error) throw new Error(item.error);
+        if (item.done) {
+          final = item;
+        } else {
+          full += item.token;
+          reply.textContent = full || '…';
+          reply.classList.remove('thinking');
+          chat.scrollTop = chat.scrollHeight;
+        }
+      }
+    }
+
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-    thinking.remove();
-    addMessage(data.response, 'assistant', `${elapsed}s · VRAM: ${(data.vram_used_gb||0).toFixed(2)} GB`);
+    reply.textContent = (final && final.response) || full;
+    reply.classList.remove('thinking');
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const vram = final ? (final.vram_used_gb || 0).toFixed(2) : '?';
+    meta.textContent = `${elapsed}s · VRAM: ${vram} GB`;
+    reply.after(meta);
+    chat.scrollTop = chat.scrollHeight;
   } catch (e) {
-    thinking.textContent = `Error: ${e.message}`;
-    thinking.classList.remove('thinking');
+    reply.textContent = `Error: ${e.message}`;
+    reply.classList.remove('thinking');
   }
   sendBtn.disabled = false;
 }

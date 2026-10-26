@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 import httpx
 import statistics
@@ -18,12 +19,23 @@ async def benchmark():
             times = []
             for _ in range(3):  # 3 runs per prompt
                 t0 = time.time()
-                resp = await client.post(f"{COORDINATOR}/infer", json={
+                # /infer now streams NDJSON (one JSON object per line) —
+                # per-token chunks, then a final {"done": true, "response":
+                # ...} line. Read lines as they arrive and keep the final one.
+                data = None
+                async with client.stream("POST", f"{COORDINATOR}/infer", json={
                     "prompt": prompt,
                     "max_new_tokens": max_tok
-                })
+                }) as resp:
+                    async for line in resp.aiter_lines():
+                        if not line.strip():
+                            continue
+                        item = json.loads(line)
+                        if item.get("done"):
+                            data = item
                 elapsed = time.time() - t0
-                data = resp.json()
+                if data is None or "error" in data:
+                    raise RuntimeError(f"Benchmark request failed: {data}")
                 tokens = len(data["response"].split())
                 times.append(elapsed)
                 print(f"[{label}] {elapsed:.2f}s | ~{tokens} tokens | {tokens/elapsed:.1f} tok/s")

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import socket
@@ -12,6 +13,7 @@ import torch
 import uvicorn
 import zmq.error
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from shared.config import (
@@ -177,13 +179,43 @@ def _zmq_loop():
 
 # ── Autoregressive generation (first worker only) ─────────────────────────────
 
-def _generate(prompt: str, max_new_tokens: int, temperature: float) -> dict:
+_STREAM_DONE = object()
+
+
+def _safe_next(gen):
     """
-    KV-cached autoregressive loop. Step 0 is a single prefill pass over the
-    full prompt (reset_cache=True on every worker). Every step after that
-    sends only the single newly generated token — each worker's own
-    self.kv_cache already holds everything before it, so payload size is
-    now flat per step instead of growing with sequence length.
+    Step a generator from a worker thread (via run_in_executor). Returns
+    the next yielded value, _STREAM_DONE on normal completion, or an error
+    dict on an unexpected failure — so the async /infer handler never has
+    to catch an exception that was raised on a different thread.
+    """
+    try:
+        return next(gen)
+    except StopIteration:
+        return _STREAM_DONE
+    except Exception as e:
+        log.exception("Error during streamed generation")
+        return {"done": True, "error": str(e)}
+
+
+def _generate_stream(prompt: str, max_new_tokens: int, temperature: float):
+    """
+    Generator version of the KV-cached decode loop — Phase 1 token
+    streaming. Yields one dict per generated token as soon as it's
+    produced, then a final summary dict with done=True. The /infer route
+    below serializes each yielded dict as one line of NDJSON (one JSON
+    object per line). This is NOT the OpenAI-compatible SSE format —
+    that's Phase 9's /v1/chat/completions, still future work.
+
+    Known limitation: each streamed token is decoded individually via
+    runner.decode([token_id]) for live-preview responsiveness, rather than
+    re-decoding the whole sequence every step. For this tokenizer family
+    (GPT-NeoX/BPE, skip_special_tokens=True) that generally matches the
+    full-sequence decode, but per-token decode of BPE output isn't
+    guaranteed identical to joint decode in every edge case. The final
+    "response" field below is always the authoritative full-sequence
+    decode of every generated token together — treat the per-step "token"
+    pieces as a live preview, and the final "response" as ground truth.
 
     local_only (is_first AND is_last on this same worker — single-node
     placement, zero inter-node hops): runner.forward() already walks every
@@ -242,6 +274,14 @@ def _generate(prompt: str, max_new_tokens: int, temperature: float) -> dict:
 
         generated_tokens.append(token_id)
         seq_len += 1
+
+        yield {
+            "token":    runner.decode([token_id]),
+            "token_id": token_id,
+            "step":     step,
+            "done":     False,
+        }
+
         # From here on we only ever feed the single newest token back in —
         # past context lives in each worker's kv_cache, not in this tensor.
         next_input = torch.tensor([[token_id]], dtype=torch.long)
@@ -257,7 +297,8 @@ def _generate(prompt: str, max_new_tokens: int, temperature: float) -> dict:
         f"({tok_per_s:.2f} tok/s)"
     )
 
-    return {
+    yield {
+        "done":             True,
         "response":         runner.decode(generated_tokens),
         "tokens_generated": len(generated_tokens),
         "elapsed_s":        round(elapsed, 3),
@@ -374,6 +415,16 @@ app = FastAPI(title="OLMoE Worker", lifespan=lifespan)
 
 @app.post("/infer")
 async def infer(req: InferReq):
+    """
+    Streams one NDJSON object per line: per-token {"token":..., "done":false}
+    while generating, then one final {"done": true, "response": <full text>,
+    "tokens_generated":..., "elapsed_s":..., "tok_per_s":..., "vram_used_gb":...}.
+    An error that happens mid-stream (e.g. a downstream worker dying) is
+    reported as a final {"done": true, "error": "..."} line instead of an
+    HTTP error status — once streaming has started, the response status is
+    already committed and can't be changed, which is a real limitation of
+    moving to streaming, not an oversight.
+    """
     if not runner or not runner.is_first:
         raise HTTPException(
             status_code=400,
@@ -384,18 +435,20 @@ async def infer(req: InferReq):
             status_code=503,
             detail=f"Worker not ready (status={current_status!r})",
         )
+
+    gen  = _generate_stream(req.prompt, req.max_new_tokens, req.temperature)
     loop = asyncio.get_event_loop()
-    try:
-        result = await loop.run_in_executor(
-            _infer_executor, _generate,
-            req.prompt, req.max_new_tokens, req.temperature,
-        )
-    except TimeoutError as e:
-        raise HTTPException(status_code=504, detail=str(e))
-    except Exception as e:
-        log.exception("Inference error")
-        raise HTTPException(status_code=500, detail=str(e))
-    return result
+
+    async def _byte_stream():
+        while True:
+            item = await loop.run_in_executor(_infer_executor, _safe_next, gen)
+            if item is _STREAM_DONE:
+                break
+            yield (json.dumps(item) + "\n").encode("utf-8")
+            if item.get("done"):
+                break
+
+    return StreamingResponse(_byte_stream(), media_type="application/x-ndjson")
 
 
 @app.get("/health")

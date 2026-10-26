@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -6,7 +7,7 @@ from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -195,16 +196,31 @@ async def list_workers():
 
 @app.post("/infer")
 async def infer(req: InferReq):
+    """
+    Proxy-streams the first worker's NDJSON /infer response straight
+    through, byte for byte. Checked upfront (pipeline_ready) still raises
+    a normal HTTP error since nothing has streamed yet; a connection
+    failure to the worker that happens AFTER streaming starts can't be
+    turned into an HTTP 502 any more — the response status is already
+    committed once the first bytes go out — so it's reported as a final
+    NDJSON {"done": true, "error": ...} line instead, same convention the
+    worker itself uses.
+    """
     if not registry.pipeline_ready():
         raise HTTPException(status_code=503, detail="Pipeline not ready — workers still loading.")
     first = registry.pipeline()[0]
     url   = f"http://{first.ip}:{first.http_port}/infer"
-    async with httpx.AsyncClient(timeout=300.0) as client:
+
+    async def _proxy_stream():
         try:
-            resp = await client.post(url, json=req.model_dump())
-            return resp.json()
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                async with client.stream("POST", url, json=req.model_dump()) as upstream:
+                    async for chunk in upstream.aiter_bytes():
+                        yield chunk
         except httpx.RequestError as e:
-            raise HTTPException(status_code=502, detail=f"Worker unreachable: {e}")
+            yield (json.dumps({"done": True, "error": f"Worker unreachable: {e}"}) + "\n").encode("utf-8")
+
+    return StreamingResponse(_proxy_stream(), media_type="application/x-ndjson")
 
 
 @app.get("/health")
