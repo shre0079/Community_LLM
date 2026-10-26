@@ -96,7 +96,7 @@ async def _wait_for_topology() -> dict:
                 data = resp.json()
                 # Fix: count the actual workers returned, not a tautology
                 n_loaded = len(data["workers"])
-                log.info(f"Topology: {n_loaded}/3 workers loaded, ready={data['ready']}")
+                log.info(f"Topology: {n_loaded} worker(s) loaded, ready={data['ready']}")
                 if data["ready"]:
                     return data
             except Exception as e:
@@ -184,42 +184,61 @@ def _generate(prompt: str, max_new_tokens: int, temperature: float) -> dict:
     sends only the single newly generated token — each worker's own
     self.kv_cache already holds everything before it, so payload size is
     now flat per step instead of growing with sequence length.
+
+    local_only (is_first AND is_last on this same worker — single-node
+    placement, zero inter-node hops): runner.forward() already walks every
+    layer and returns a sampled token directly, so there is nothing to send
+    downstream and nothing to wait for. Routing that case through
+    pipeline_conn would (a) hand a token tensor to send_hidden(), which
+    expects hidden states, and (b) block on recv_token() forever, since
+    is_first workers never start the background _zmq_loop that would
+    normally answer it — every step would hang for the full ZMQ timeout
+    and then fail. So the ZMQ round-trip below only runs for the
+    multi-worker (sharded) case.
     """
-    input_ids         = runner.encode(prompt)      # [1, prompt_len]
-    next_input        = input_ids                  # what THIS worker still needs to process
+    local_only         = runner.is_first and runner.is_last
+    input_ids          = runner.encode(prompt)      # [1, prompt_len]
+    next_input         = input_ids                  # what THIS worker still needs to process
     generated_tokens: list[int] = []
-    seq_len           = input_ids.shape[1]          # for logging/metadata only
+    seq_len            = input_ids.shape[1]          # for logging/metadata only
     t0 = time.time()
 
     for step in range(max_new_tokens):
         reset_cache = (step == 0)
 
         # Our layers: embed (prefill: full prompt / decode: 1 new token)
-        hidden = runner.forward(next_input, temperature=temperature, reset_cache=reset_cache)
+        out = runner.forward(next_input, temperature=temperature, reset_cache=reset_cache)
 
-        # Payload is now flat per step (1 position) instead of growing with seq_len.
-        nbytes = hidden.element_size() * hidden.nelement()
+        if local_only:
+            # Zero-hop path: `out` is already the sampled next token.
+            token_id = out.item()
+            is_done  = (token_id == runner.eos_token_id)
+            nbytes   = 0
+        else:
+            hidden = out
+            nbytes = hidden.element_size() * hidden.nelement()
+            # Send downstream with temperature + reset_cache so every stage's
+            # cache stays in sync for this request.
+            pipeline_conn.send_hidden(
+                hidden, {"temperature": temperature, "step": step, "reset_cache": reset_cache}
+            )
+            try:
+                token_id, is_done = pipeline_conn.recv_token()
+            except zmq.error.Again:
+                raise TimeoutError(
+                    "No token received within timeout window. "
+                    "A downstream worker may be dead."
+                )
+
+        # Payload is now flat per step (1 position) instead of growing with
+        # seq_len, and zero in local mode (no network hop at all).
         log.info(
             f"Step {step + 1}/{max_new_tokens} "
             f"{'prefill' if reset_cache else 'decode'} "
+            f"{'local' if local_only else 'networked'} "
             f"new_positions={next_input.shape[1]} seq_len={seq_len} "
             f"payload={nbytes / 1024:.1f} KB"
         )
-
-        # Send downstream with temperature + reset_cache so every stage's
-        # cache stays in sync for this request.
-        pipeline_conn.send_hidden(
-            hidden, {"temperature": temperature, "step": step, "reset_cache": reset_cache}
-        )
-
-        # Wait for next-token from last worker
-        try:
-            token_id, is_done = pipeline_conn.recv_token()
-        except zmq.error.Again:
-            raise TimeoutError(
-                "No token received within timeout window. "
-                "A downstream worker may be dead."
-            )
 
         generated_tokens.append(token_id)
         seq_len += 1
@@ -312,8 +331,16 @@ async def lifespan(app: FastAPI):
     # ── Step 5: Poll topology until all workers are loaded ────────────────
     topology = await _wait_for_topology()
 
+    local_only = result["is_first"] and result["is_last"]
+
     # ── Step 6: Wire ZMQ ─────────────────────────────────────────────────
-    _wire_zmq(assignment, topology)
+    # Skipped entirely in local mode — a single worker holding every layer
+    # has nothing to send to or receive from over the network, so there is
+    # no pipeline to wire (see _generate()'s local_only path).
+    if not local_only:
+        _wire_zmq(assignment, topology)
+    else:
+        log.info("Single-node placement — skipping ZMQ wiring (zero inter-node hops).")
 
     # ── Step 7: Go active ─────────────────────────────────────────────────
     current_status = "active"
@@ -321,7 +348,7 @@ async def lifespan(app: FastAPI):
 
     # ── Step 8: Start ZMQ loop for middle / last workers ─────────────────
     zmq_future = None
-    if not result["is_first"]:
+    if not result["is_first"] and not local_only:
         _stop_event.clear()
         zmq_future = loop.run_in_executor(_zmq_executor, _zmq_loop)
 

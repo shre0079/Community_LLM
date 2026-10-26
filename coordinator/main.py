@@ -11,8 +11,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from coordinator.health_monitor import HealthMonitor
-from coordinator.registry import WorkerRegistry, WorkerStatus
+from coordinator.registry import WorkerInfo, WorkerRegistry, WorkerStatus
 from coordinator.scheduler import Scheduler
+from shared.config import SINGLE_NODE_VRAM_GB
 
 log = logging.getLogger(__name__)
 logging.basicConfig(
@@ -109,6 +110,41 @@ async def heartbeat(req: HeartbeatReq):
     return {"ok": True}
 
 
+def _placement_info(pipeline: list[WorkerInfo]) -> dict:
+    """
+    Observability only (design doc Section 4, requirement #8): describes
+    the CURRENT pipeline's placement decision, derived live from registry
+    state rather than stored separately. Not a full admin/metrics endpoint
+    (that's Phase 9) — just enough to see local-vs-sharded, why, and the
+    resulting hop count.
+    """
+    if not pipeline:
+        return {"mode": "none", "hop_count": 0, "nodes": [], "reason": "no workers registered yet"}
+
+    if len(pipeline) == 1 and pipeline[0].is_first and pipeline[0].is_last:
+        w = pipeline[0]
+        return {
+            "mode":      "local",
+            "hop_count": 0,
+            "nodes":     [w.hostname],
+            "reason": (
+                f"single node, vram_gb={w.vram_gb:.1f} >= "
+                f"single-node threshold {SINGLE_NODE_VRAM_GB:.1f} GB"
+            ),
+        }
+
+    return {
+        "mode":      "sharded",
+        "hop_count": len(pipeline) - 1,
+        "nodes":     [w.hostname for w in pipeline],
+        "reason": (
+            "no single registered node met the single-node VRAM threshold "
+            f"({SINGLE_NODE_VRAM_GB:.1f} GB) at assignment time — using the "
+            "fixed minimum-depth sharded fallback"
+        ),
+    }
+
+
 @app.get("/topology")
 async def topology():
     """
@@ -119,7 +155,8 @@ async def topology():
     pipeline = registry.pipeline()
     ready    = registry.pipeline_ready()
     return {
-        "ready": ready,
+        "ready":     ready,
+        "placement": _placement_info(pipeline),
         "workers": [
             {
                 "worker_id":   w.worker_id,

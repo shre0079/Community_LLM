@@ -135,10 +135,17 @@ class ShardRunner:
 
         for idx in range(self.layer_start, self.layer_end + 1):
             layer  = m.model.layers[idx]
+            # NOTE: transformers>=5 (confirmed on 5.15.1) names this kwarg
+            # `past_key_values` (plural). OlmoeDecoderLayer.forward() ends in
+            # `**kwargs: Unpack[TransformersKwargs]`, a catch-all — passing the
+            # wrong name here does NOT raise TypeError, it silently vanishes
+            # into **kwargs and the layer runs with no cache at all. That bug
+            # shipped once already (every decode step attended to nothing
+            # before itself); do not reintroduce a bare name guess here.
             kwargs = dict(
                 attention_mask=causal_mask,
                 position_ids=position_ids,
-                past_key_value=self.kv_cache,
+                past_key_values=self.kv_cache,
                 cache_position=position_ids[0],
                 use_cache=True,
                 output_attentions=False,
@@ -146,14 +153,7 @@ class ShardRunner:
             )
             if position_embeddings is not None:
                 kwargs["position_embeddings"] = position_embeddings
-            try:
-                out = layer(hidden, **kwargs)
-            except TypeError:
-                # Older transformer versions don't accept all kwargs — strip to the
-                # legacy subset. NOTE: if this fallback fires, use_cache/past_key_value
-                # are dropped too, which silently disables caching for this layer call —
-                # verify on the real transformers version before trusting cached decode.
-                out = layer(hidden, attention_mask=causal_mask, position_ids=position_ids)
+            out = layer(hidden, **kwargs)
 
             hidden = out[0] if isinstance(out, tuple) else out
 
