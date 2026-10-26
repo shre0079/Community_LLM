@@ -32,3 +32,10 @@ SIMULATE_VRAM_GB = float(os.getenv("SIMULATE_VRAM_GB", "0"))
 EST_MODEL_VRAM_GB    = float(os.getenv("EST_MODEL_VRAM_GB", "6.0"))  # 4-bit NF4 weights + CUDA/bnb overhead
 EST_KV_ACTIVATION_GB = float(os.getenv("EST_KV_ACTIVATION_GB", "2.0"))  # KV-cache + activations headroom
 SINGLE_NODE_VRAM_GB  = EST_MODEL_VRAM_GB + EST_KV_ACTIVATION_GB
+
+# Number of stages to use for the SHARDED fallback (coordinator/scheduler.py)
+# when single-node placement doesn't apply. This is still the fixed-split
+# scaffold, not Phase 3's real greedy_pack — only 2 and 3 are defined below.
+# Lets Phase 2's two-node pipeline milestone actually be tested with two
+# machines instead of the original hardcoded three.
+PIPELINE_STAGES = int(os.getenv("PIPELINE_STAGES", "3"))

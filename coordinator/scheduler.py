@@ -2,6 +2,7 @@ import logging
 
 from coordinator.registry import WorkerRegistry
 from shared.config import (
+    PIPELINE_STAGES,
     SINGLE_NODE_VRAM_GB,
     TOTAL_LAYERS,
     ZMQ_IN_PORT,
@@ -11,11 +12,30 @@ from shared.config import (
 log = logging.getLogger(__name__)
 
 # (layer_start, layer_end, is_first, is_last)
-LAYER_RANGES = [
+# Fixed-split scaffolds for the SHARDED fallback — still not the real Phase 3
+# greedy_pack. Selected by PIPELINE_STAGES (shared/config.py) so the Phase 2
+# "two-node pipeline" milestone can actually be tested with two machines.
+_LAYER_RANGES_3 = [
     (0,   5, True,  False),   # 6 layers — embedding lives here
     (6,  10, False, False),   # 5 layers
     (11, 15, False, True),    # 5 layers — norm + lm_head live here
 ]
+
+_LAYER_RANGES_2 = [
+    (0,   7, True,  False),   # 8 layers — embedding lives here
+    (8,  15, False, True),    # 8 layers — norm + lm_head live here
+]
+
+_LAYER_RANGES_BY_STAGE_COUNT = {2: _LAYER_RANGES_2, 3: _LAYER_RANGES_3}
+
+if PIPELINE_STAGES not in _LAYER_RANGES_BY_STAGE_COUNT:
+    raise ValueError(
+        f"PIPELINE_STAGES={PIPELINE_STAGES} has no defined layer split — "
+        f"only {sorted(_LAYER_RANGES_BY_STAGE_COUNT)} are supported until "
+        f"Phase 3's real greedy_pack replaces this fixed-split scaffold."
+    )
+
+LAYER_RANGES = _LAYER_RANGES_BY_STAGE_COUNT[PIPELINE_STAGES]
 
 
 class Scheduler:
